@@ -6,16 +6,17 @@
  *
  * Referer strategy:
  *   - embed.js + app/index.html on gr2026  → Referer: https://www.parool.nl/
+ *   - gr2026-data/*                        → Referer: https://gr2026.stemwijzer.nl/
  *   - everything else                      → no Referer at all
- *     (same as pasting a URL directly into the address bar — always allowed)
  *
- * URL rewriting in responses rewrites ALL https://*.stemwijzer.nl/... URLs
- * to http://localhost:3000/proxy/<subdomain>/... so every subsequent fetch
- * also flows through this proxy.
+ * URL rewriting replaces all https://*.stemwijzer.nl URLs in responses with
+ * the public host URL so the browser's subsequent fetches also go through us.
  *
- * Usage:
- *   node server.js
- * Then open: http://localhost:3000
+ * Usage (local):
+ *   node server.js          → http://localhost:3000
+ *
+ * Usage (Render):
+ *   Render sets RENDER_EXTERNAL_URL automatically — no config needed.
  */
 
 const http  = require("http");
@@ -24,18 +25,39 @@ const url   = require("url");
 const zlib  = require("zlib");
 
 const PORT = process.env.PORT || 3000;
+
 const SPOOF_REFERER = "https://www.parool.nl/";
-const LOCAL_ORIGIN  = "http://localhost:" + PORT;
+
+// On Render, RENDER_EXTERNAL_URL is set automatically to the public URL.
+// Locally it falls back to http://localhost:PORT.
+// We strip any trailing slash so concatenation is clean.
+const PUBLIC_HOST = process.env.RENDER_EXTERNAL_URL
+  ? process.env.RENDER_EXTERNAL_URL.trimEnd().replace(/\/+$/, "")
+  : "http://localhost:" + PORT;
+
 const STEMWIJZER_RE = /https:\/\/([\w-]+\.stemwijzer\.nl)/g;
 
-// Explicit referer/origin rules. Checked in order; first match wins.
-// Anything not matched gets NO referer/origin (safe default for plain assets).
+// Referer rules — checked in order, first match wins.
+// No match = no Referer header sent (safe default, mimics direct URL paste).
 const REFERER_RULES = [
-  // Embed entry points must look like they come from parool.nl
-  { sub: 'gr2026',      path: /^\/embed\/embed\.js/, referer: 'https://www.parool.nl/',        origin: 'https://www.parool.nl' },
-  { sub: 'gr2026',      path: /^\/app\/index\.html/, referer: 'https://www.parool.nl/',        origin: 'https://www.parool.nl' },
-  // Data API is fetched from inside the iframe — must look like it comes from the app itself
-  { sub: 'gr2026-data', path: /^\//,                   referer: 'https://gr2026.stemwijzer.nl/', origin: 'https://gr2026.stemwijzer.nl' },
+  {
+    sub: "gr2026",
+    path: /^\/embed\/embed\.js/,
+    referer: "https://www.parool.nl/",
+    origin: "https://www.parool.nl",
+  },
+  {
+    sub: "gr2026",
+    path: /^\/app\/index\.html/,
+    referer: "https://www.parool.nl/",
+    origin: "https://www.parool.nl",
+  },
+  {
+    sub: "gr2026-data",
+    path: /^\//,
+    referer: "https://gr2026.stemwijzer.nl/",
+    origin: "https://gr2026.stemwijzer.nl",
+  },
 ];
 
 // ── Wrapper HTML ──────────────────────────────────────────────────────────────
@@ -132,7 +154,7 @@ const WRAPPER_HTML = `<!DOCTYPE html>
 
   <script>
     function toggleFS() {
-      const el = document.getElementById("votematch-container");
+      var el = document.getElementById("votematch-container");
       if (!document.fullscreenElement) el.requestFullscreen();
       else document.exitFullscreen();
     }
@@ -142,95 +164,97 @@ const WRAPPER_HTML = `<!DOCTYPE html>
 
 // ── Decompress ────────────────────────────────────────────────────────────────
 function decompress(buffer, encoding) {
-  return new Promise((resolve, reject) => {
-    if (encoding === "gzip")    return zlib.gunzip(buffer,           (e, b) => e ? reject(e) : resolve(b));
-    if (encoding === "deflate") return zlib.inflate(buffer,          (e, b) => e ? reject(e) : resolve(b));
-    if (encoding === "br")      return zlib.brotliDecompress(buffer, (e, b) => e ? reject(e) : resolve(b));
+  return new Promise(function(resolve, reject) {
+    if (encoding === "gzip")    return zlib.gunzip(buffer,           function(e,b){ e ? reject(e) : resolve(b); });
+    if (encoding === "deflate") return zlib.inflate(buffer,          function(e,b){ e ? reject(e) : resolve(b); });
+    if (encoding === "br")      return zlib.brotliDecompress(buffer, function(e,b){ e ? reject(e) : resolve(b); });
     resolve(buffer);
   });
 }
 
 // ── URL rewriter ──────────────────────────────────────────────────────────────
-// Rewrites every https://<sub>.stemwijzer.nl  →  http://localhost:PORT/proxy/<sub>
-// so all downstream fetches (from rewritten JS/HTML) flow through this proxy.
+// Replaces every https://<sub>.stemwijzer.nl with PUBLIC_HOST/proxy/<sub>
+// so all downstream fetches triggered by rewritten JS/HTML go through this proxy.
 function rewriteBody(text) {
-  return text.replace(STEMWIJZER_RE, (_match, host) => {
-    const sub = host.replace(".stemwijzer.nl", "");
-    return LOCAL_ORIGIN + "/proxy/" + sub;
+  return text.replace(STEMWIJZER_RE, function(_match, host) {
+    var sub = host.replace(".stemwijzer.nl", "");
+    return PUBLIC_HOST + "/proxy/" + sub;
   });
 }
 
 // ── Proxy a single upstream request ──────────────────────────────────────────
 function proxyRequest(req, res, subdomain, upstreamPath) {
-  const hostname = subdomain + ".stemwijzer.nl";
+  var hostname = subdomain + ".stemwijzer.nl";
+  var rule = null;
+  for (var i = 0; i < REFERER_RULES.length; i++) {
+    if (REFERER_RULES[i].sub === subdomain && REFERER_RULES[i].path.test(upstreamPath)) {
+      rule = REFERER_RULES[i];
+      break;
+    }
+  }
 
-  const rule = REFERER_RULES.find(r => r.sub === subdomain && r.path.test(upstreamPath));
-
-  const reqHeaders = {
-    'accept':          req.headers['accept'] || '*/*',
-    'accept-encoding': 'gzip, deflate, identity',
-    'accept-language': req.headers['accept-language'] || 'nl,en;q=0.9',
-    'user-agent':      req.headers['user-agent'] ||
-                       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0',
-    'host':            hostname,
+  var reqHeaders = {
+    "accept":          req.headers["accept"] || "*/*",
+    "accept-encoding": "gzip, deflate, identity",
+    "accept-language": req.headers["accept-language"] || "nl,en;q=0.9",
+    "user-agent":      req.headers["user-agent"] ||
+                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "host":            hostname,
   };
 
   if (rule) {
-    reqHeaders['referer'] = rule.referer;
-    reqHeaders['origin']  = rule.origin;
-    console.log(`  [rule: ${rule.origin}] ${hostname}${upstreamPath}`);
+    reqHeaders["referer"] = rule.referer;
+    reqHeaders["origin"]  = rule.origin;
+    console.log("  [rule: " + rule.origin + "] " + hostname + upstreamPath);
   } else {
-    console.log(`  [no referer]          ${hostname}${upstreamPath}`);
+    console.log("  [no referer]     " + hostname + upstreamPath);
   }
 
-  const options = {
-    hostname,
+  var options = {
+    hostname: hostname,
     port: 443,
     path: upstreamPath,
     method: req.method,
     headers: reqHeaders,
   };
 
-  const upstreamReq = https.request(options, (upstreamRes) => {
-    const status      = upstreamRes.statusCode;
-    const contentType = upstreamRes.headers["content-type"] || "";
-    const encoding    = upstreamRes.headers["content-encoding"] || "";
+  var upstreamReq = https.request(options, function(upstreamRes) {
+    var status      = upstreamRes.statusCode;
+    var contentType = upstreamRes.headers["content-type"] || "";
+    var encoding    = upstreamRes.headers["content-encoding"] || "";
 
-    const outHeaders = { ...upstreamRes.headers };
+    var outHeaders = Object.assign({}, upstreamRes.headers);
     delete outHeaders["content-security-policy"];
     delete outHeaders["content-security-policy-report-only"];
     delete outHeaders["x-frame-options"];
-    delete outHeaders["content-encoding"]; // we decompress; length changes
+    delete outHeaders["content-encoding"];
     outHeaders["access-control-allow-origin"] = "*";
 
-    console.log(`    <- ${status} [${contentType.split(";")[0]}]`);
+    console.log("    <- " + status + " [" + contentType.split(";")[0] + "] " + upstreamPath.split("?")[0]);
 
     if (/text|javascript|json/.test(contentType)) {
-      const chunks = [];
-      upstreamRes.on("data", c => chunks.push(c));
-      upstreamRes.on("end", async () => {
-        try {
-          const raw       = Buffer.concat(chunks);
-          const plain     = await decompress(raw, encoding);
-          const rewritten = rewriteBody(plain.toString("utf8"));
-          const outBuf    = Buffer.from(rewritten, "utf8");
+      var chunks = [];
+      upstreamRes.on("data", function(c) { chunks.push(c); });
+      upstreamRes.on("end", function() {
+        decompress(Buffer.concat(chunks), encoding).then(function(plain) {
+          var rewritten = rewriteBody(plain.toString("utf8"));
+          var outBuf    = Buffer.from(rewritten, "utf8");
           outHeaders["content-length"] = String(outBuf.length);
           res.writeHead(status, outHeaders);
           res.end(outBuf);
-        } catch (e) {
+        }).catch(function(e) {
           console.error("  rewrite error:", e.message);
           res.writeHead(502);
           res.end("Proxy rewrite error: " + e.message);
-        }
+        });
       });
     } else {
-      // Binary (images, fonts, wasm, etc.) — stream straight through
       res.writeHead(status, outHeaders);
       upstreamRes.pipe(res);
     }
   });
 
-  upstreamReq.on("error", err => {
+  upstreamReq.on("error", function(err) {
     console.error("  upstream error:", err.message);
     res.writeHead(502);
     res.end("Bad gateway: " + err.message);
@@ -240,23 +264,21 @@ function proxyRequest(req, res, subdomain, upstreamPath) {
 }
 
 // ── Main server ───────────────────────────────────────────────────────────────
-const server = http.createServer((req, res) => {
-  const parsed   = url.parse(req.url);
-  const pathname = parsed.pathname;
-  const qs       = parsed.search || "";
+var server = http.createServer(function(req, res) {
+  var parsed   = url.parse(req.url);
+  var pathname = parsed.pathname;
+  var qs       = parsed.search || "";
 
-  // Root → wrapper page
   if (pathname === "/" || pathname === "/index.html") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(WRAPPER_HTML);
     return;
   }
 
-  // /proxy/<subdomain>/path  (any *.stemwijzer.nl subdomain)
-  const m = pathname.match(/^\/proxy\/([\w-]+)(\/.*)?$/);
+  var m = pathname.match(/^\/proxy\/([\w-]+)(\/.*)?$/);
   if (m) {
-    const subdomain    = m[1];
-    const upstreamPath = (m[2] || "/") + qs;
+    var subdomain    = m[1];
+    var upstreamPath = (m[2] || "/") + qs;
     proxyRequest(req, res, subdomain, upstreamPath);
     return;
   }
@@ -265,8 +287,9 @@ const server = http.createServer((req, res) => {
   res.end("Not found. Requests must use /proxy/<subdomain>/path");
 });
 
-server.listen(PORT, () => {
-  console.log(`\n✅  Stemwijzer proxy -> http://localhost:${PORT}`);
-  console.log(`   Handles any *.stemwijzer.nl subdomain via /proxy/<sub>/path`);
-  console.log(`   Open the URL above in Chrome, then Translate Page.\n`);
+server.listen(PORT, function() {
+  console.log("\n✅  Stemwijzer proxy running");
+  console.log("   Public host : " + PUBLIC_HOST);
+  console.log("   Local port  : " + PORT);
+  console.log("   Open the URL above in Chrome, then Translate Page.\n");
 });
