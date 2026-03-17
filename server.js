@@ -1,45 +1,47 @@
 /**
  * Stemwijzer local proxy
- * Serves the wrapper page and proxies all assets/data for the embed.
+ *
+ * Routes all *.stemwijzer.nl subdomains through /proxy/<subdomain>/path
+ * so the browser never makes direct requests that would leak localhost as referer.
  *
  * Referer strategy:
- *   - embed.js and the iframe entry point  → Referer: https://www.parool.nl/
- *   - everything else (assets, API calls)  → no Referer header at all
- *     (mimics what a browser does when you paste a URL directly into the bar)
+ *   - embed.js + app/index.html on gr2026  → Referer: https://www.parool.nl/
+ *   - everything else                      → no Referer at all
+ *     (same as pasting a URL directly into the address bar — always allowed)
  *
- * Also rewrites absolute URLs inside proxied HTML/JS/CSS responses so that
- * secondary fetches also go through this proxy.
+ * URL rewriting in responses rewrites ALL https://*.stemwijzer.nl/... URLs
+ * to http://localhost:3000/proxy/<subdomain>/... so every subsequent fetch
+ * also flows through this proxy.
  *
  * Usage:
  *   node server.js
  * Then open: http://localhost:3000
  */
 
-const http = require("http");
+const http  = require("http");
 const https = require("https");
-const url = require("url");
-const zlib = require("zlib");
+const url   = require("url");
+const zlib  = require("zlib");
 
-const PORT = 3000;
+const PORT          = 3000;
 const SPOOF_REFERER = "https://www.parool.nl/";
-const UPSTREAM_HOST = "gr2026.stemwijzer.nl";
-const UPSTREAM_ORIGIN = "https://" + UPSTREAM_HOST;
-const LOCAL_ORIGIN   = "http://localhost:" + PORT;
+const LOCAL_ORIGIN  = "http://localhost:" + PORT;
+const STEMWIJZER_RE = /https:\/\/([\w-]+\.stemwijzer\.nl)/g;
 
-// Paths that need the parool.nl referer to pass the embed check
+// Only these need the parool.nl referer to pass the embed origin-check.
+// Everything else gets NO referer.
 const NEEDS_PAROOL_REFERER = [
-  /^\/embed\/embed\.js/,
-  /^\/app\/index\.html/,
+  { sub: "gr2026", path: /^\/embed\/embed\.js/ },
+  { sub: "gr2026", path: /^\/app\/index\.html/ },
 ];
 
-// ── Wrapper HTML served at / ──────────────────────────────────────────────────
+// ── Wrapper HTML ──────────────────────────────────────────────────────────────
 const WRAPPER_HTML = `<!DOCTYPE html>
 <html lang="nl">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- Tell the browser to send the full URL as Referer for all sub-resources -->
-  <meta name="referrer" content="unsafe-url" />
+  <meta name="referrer" content="no-referrer" />
   <title>Stemwijzer GR2026</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -88,7 +90,6 @@ const WRAPPER_HTML = `<!DOCTYPE html>
       padding: 6px 10px; font-size: 13px; cursor: pointer;
       text-decoration: none; color: inherit;
     }
-    button img, a.btn img { width: 16px; height: 16px; }
     #votematch-embed {
       width: 100%; border: none; display: block;
       min-height: 600px; height: 1161px;
@@ -98,7 +99,7 @@ const WRAPPER_HTML = `<!DOCTYPE html>
 <body>
   <div id="tip">
     <strong>💡 Tip for expats</strong>
-    Right-click anywhere → <em>Translate to English</em> (or your language).
+    Right-click anywhere on this page and choose <em>Translate to English</em>.
     Chrome will translate the entire questionnaire automatically.
   </div>
 
@@ -115,13 +116,8 @@ const WRAPPER_HTML = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!--
-      The iframe src points to our LOCAL proxy (/proxy/...) so the browser
-      sends Referer: http://localhost:3000 — but our proxy rewrites that
-      to Referer: https://www.parool.nl/ before forwarding upstream.
-    -->
     <iframe
-      src="/proxy/app/index.html#/GM0363-nl/start"
+      src="/proxy/gr2026/app/index.html#/GM0363-nl/start"
       loading="lazy"
       scrolling="no"
       allowfullscreen=""
@@ -129,11 +125,7 @@ const WRAPPER_HTML = `<!DOCTYPE html>
     </iframe>
   </div>
 
-  <!-- Embed script also served through our proxy so headers are correct -->
-  <script
-    src="/proxy/embed/embed.js?v=1.0.0&select=gm0363-nl&canselect=true"
-    defer async>
-  </script>
+  <script src="/proxy/gr2026/embed/embed.js?v=1.0.0&select=gm0363-nl&canselect=true" defer async></script>
 
   <script>
     function toggleFS() {
@@ -145,48 +137,53 @@ const WRAPPER_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ── Rewrite URLs in text responses so secondary fetches go through the proxy ──
-function rewriteBody(body, contentType) {
-  if (!/text|javascript|json/.test(contentType || "")) return body;
-  // Replace https://gr2026.stemwijzer.nl  →  http://localhost:PORT/proxy
-  return body.split(UPSTREAM_ORIGIN).join(LOCAL_ORIGIN + "/proxy");
-}
-
-// ── Decompress a buffer based on content-encoding ────────────────────────────
+// ── Decompress ────────────────────────────────────────────────────────────────
 function decompress(buffer, encoding) {
   return new Promise((resolve, reject) => {
-    if (encoding === "gzip")   return zlib.gunzip(buffer, (e, b) => e ? reject(e) : resolve(b));
-    if (encoding === "deflate") return zlib.inflate(buffer, (e, b) => e ? reject(e) : resolve(b));
-    if (encoding === "br")     return zlib.brotliDecompress(buffer, (e, b) => e ? reject(e) : resolve(b));
-    resolve(buffer); // identity / no encoding
+    if (encoding === "gzip")    return zlib.gunzip(buffer,           (e, b) => e ? reject(e) : resolve(b));
+    if (encoding === "deflate") return zlib.inflate(buffer,          (e, b) => e ? reject(e) : resolve(b));
+    if (encoding === "br")      return zlib.brotliDecompress(buffer, (e, b) => e ? reject(e) : resolve(b));
+    resolve(buffer);
   });
 }
 
-// ── Proxy helper ──────────────────────────────────────────────────────────────
-function proxyRequest(req, res, upstreamPath) {
-  const needsParoolReferer = NEEDS_PAROOL_REFERER.some(re => re.test(upstreamPath));
+// ── URL rewriter ──────────────────────────────────────────────────────────────
+// Rewrites every https://<sub>.stemwijzer.nl  →  http://localhost:PORT/proxy/<sub>
+// so all downstream fetches (from rewritten JS/HTML) flow through this proxy.
+function rewriteBody(text) {
+  return text.replace(STEMWIJZER_RE, (_match, host) => {
+    const sub = host.replace(".stemwijzer.nl", "");
+    return LOCAL_ORIGIN + "/proxy/" + sub;
+  });
+}
+
+// ── Proxy a single upstream request ──────────────────────────────────────────
+function proxyRequest(req, res, subdomain, upstreamPath) {
+  const hostname = subdomain + ".stemwijzer.nl";
+
+  const needsParool = NEEDS_PAROOL_REFERER.some(
+    r => r.sub === subdomain && r.path.test(upstreamPath)
+  );
 
   const reqHeaders = {
-    "accept":          req.headers["accept"]          || "*/*",
-    // Ask for uncompressed OR gzip — we handle both; avoids brotli issues
+    "accept":          req.headers["accept"] || "*/*",
     "accept-encoding": "gzip, deflate, identity",
     "accept-language": req.headers["accept-language"] || "nl,en;q=0.9",
-    "user-agent":      req.headers["user-agent"]      || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
-    "host":            UPSTREAM_HOST,
+    "user-agent":      req.headers["user-agent"] ||
+                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "host":            hostname,
   };
 
-  if (needsParoolReferer) {
-    // Embed entry points: pretend we're parool.nl
+  if (needsParool) {
     reqHeaders["referer"] = SPOOF_REFERER;
     reqHeaders["origin"]  = "https://www.parool.nl";
-    console.log(`  → sending parool referer for ${upstreamPath}`);
+    console.log(`  [parool referer] ${hostname}${upstreamPath}`);
   } else {
-    // Assets/API: no referer (mimics direct browser navigation — always works)
-    console.log(`  → no referer for ${upstreamPath}`);
+    console.log(`  [no referer]     ${hostname}${upstreamPath}`);
   }
 
   const options = {
-    hostname: UPSTREAM_HOST,
+    hostname,
     port: 443,
     path: upstreamPath,
     method: req.method,
@@ -198,43 +195,42 @@ function proxyRequest(req, res, upstreamPath) {
     const contentType = upstreamRes.headers["content-type"] || "";
     const encoding    = upstreamRes.headers["content-encoding"] || "";
 
-    // Strip problematic response headers
     const outHeaders = { ...upstreamRes.headers };
     delete outHeaders["content-security-policy"];
+    delete outHeaders["content-security-policy-report-only"];
     delete outHeaders["x-frame-options"];
-    delete outHeaders["content-encoding"]; // we'll re-encode ourselves if needed
+    delete outHeaders["content-encoding"]; // we decompress; length changes
     outHeaders["access-control-allow-origin"] = "*";
 
-    console.log(`  ← ${status} ${contentType.split(";")[0]} [${upstreamPath.split("?")[0]}]`);
+    console.log(`    <- ${status} [${contentType.split(";")[0]}]`);
 
-    // For text/JS/JSON: buffer, decompress, rewrite URLs, re-send
     if (/text|javascript|json/.test(contentType)) {
       const chunks = [];
       upstreamRes.on("data", c => chunks.push(c));
       upstreamRes.on("end", async () => {
         try {
           const raw       = Buffer.concat(chunks);
-          const decompressed = await decompress(raw, encoding);
-          const rewritten = rewriteBody(decompressed.toString("utf8"), contentType);
+          const plain     = await decompress(raw, encoding);
+          const rewritten = rewriteBody(plain.toString("utf8"));
           const outBuf    = Buffer.from(rewritten, "utf8");
           outHeaders["content-length"] = String(outBuf.length);
           res.writeHead(status, outHeaders);
           res.end(outBuf);
         } catch (e) {
-          console.error("Decompress/rewrite error:", e.message);
+          console.error("  rewrite error:", e.message);
           res.writeHead(502);
           res.end("Proxy rewrite error: " + e.message);
         }
       });
     } else {
-      // Binary assets (images, fonts, wasm…): stream straight through
+      // Binary (images, fonts, wasm, etc.) — stream straight through
       res.writeHead(status, outHeaders);
       upstreamRes.pipe(res);
     }
   });
 
-  upstreamReq.on("error", (err) => {
-    console.error("Upstream error:", err.message);
+  upstreamReq.on("error", err => {
+    console.error("  upstream error:", err.message);
     res.writeHead(502);
     res.end("Bad gateway: " + err.message);
   });
@@ -246,33 +242,30 @@ function proxyRequest(req, res, upstreamPath) {
 const server = http.createServer((req, res) => {
   const parsed   = url.parse(req.url);
   const pathname = parsed.pathname;
+  const qs       = parsed.search || "";
 
-  // Serve wrapper page
+  // Root → wrapper page
   if (pathname === "/" || pathname === "/index.html") {
-    console.log("GET / → wrapper page");
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(WRAPPER_HTML);
     return;
   }
 
-  // Everything else is a proxied upstream request
-  // Support two URL shapes:
-  //   /proxy/some/path   (explicit prefix from our HTML)
-  //   /some/path         (absolute URLs rewritten inside JS/HTML by rewriteBody)
-  let upstreamPath;
-  if (pathname.startsWith("/proxy/")) {
-    upstreamPath = pathname.slice("/proxy".length) + (parsed.search || "");
-  } else {
-    // Treat as a direct upstream path (rewritten URLs inside JS won't have /proxy prefix)
-    upstreamPath = pathname + (parsed.search || "");
+  // /proxy/<subdomain>/path  (any *.stemwijzer.nl subdomain)
+  const m = pathname.match(/^\/proxy\/([\w-]+)(\/.*)?$/);
+  if (m) {
+    const subdomain    = m[1];
+    const upstreamPath = (m[2] || "/") + qs;
+    proxyRequest(req, res, subdomain, upstreamPath);
+    return;
   }
 
-  console.log(`${req.method} ${upstreamPath}`);
-  proxyRequest(req, res, upstreamPath);
+  res.writeHead(404);
+  res.end("Not found. Requests must use /proxy/<subdomain>/path");
 });
 
 server.listen(PORT, () => {
-  console.log(`\n✅  Stemwijzer proxy running at http://localhost:${PORT}`);
-  console.log(`   Open that URL in Chrome and use Translate Page as normal.`);
-  console.log(`   Watch this console to see which requests succeed/fail.\n`);
+  console.log(`\n✅  Stemwijzer proxy -> http://localhost:${PORT}`);
+  console.log(`   Handles any *.stemwijzer.nl subdomain via /proxy/<sub>/path`);
+  console.log(`   Open the URL above in Chrome, then Translate Page.\n`);
 });
