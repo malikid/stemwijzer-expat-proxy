@@ -28,11 +28,14 @@ const SPOOF_REFERER = "https://www.parool.nl/";
 const LOCAL_ORIGIN  = "http://localhost:" + PORT;
 const STEMWIJZER_RE = /https:\/\/([\w-]+\.stemwijzer\.nl)/g;
 
-// Only these need the parool.nl referer to pass the embed origin-check.
-// Everything else gets NO referer.
-const NEEDS_PAROOL_REFERER = [
-  { sub: "gr2026", path: /^\/embed\/embed\.js/ },
-  { sub: "gr2026", path: /^\/app\/index\.html/ },
+// Explicit referer/origin rules. Checked in order; first match wins.
+// Anything not matched gets NO referer/origin (safe default for plain assets).
+const REFERER_RULES = [
+  // Embed entry points must look like they come from parool.nl
+  { sub: 'gr2026',      path: /^\/embed\/embed\.js/, referer: 'https://www.parool.nl/',        origin: 'https://www.parool.nl' },
+  { sub: 'gr2026',      path: /^\/app\/index\.html/, referer: 'https://www.parool.nl/',        origin: 'https://www.parool.nl' },
+  // Data API is fetched from inside the iframe — must look like it comes from the app itself
+  { sub: 'gr2026-data', path: /^\//,                   referer: 'https://gr2026.stemwijzer.nl/', origin: 'https://gr2026.stemwijzer.nl' },
 ];
 
 // ── Wrapper HTML ──────────────────────────────────────────────────────────────
@@ -161,25 +164,23 @@ function rewriteBody(text) {
 function proxyRequest(req, res, subdomain, upstreamPath) {
   const hostname = subdomain + ".stemwijzer.nl";
 
-  const needsParool = NEEDS_PAROOL_REFERER.some(
-    r => r.sub === subdomain && r.path.test(upstreamPath)
-  );
+  const rule = REFERER_RULES.find(r => r.sub === subdomain && r.path.test(upstreamPath));
 
   const reqHeaders = {
-    "accept":          req.headers["accept"] || "*/*",
-    "accept-encoding": "gzip, deflate, identity",
-    "accept-language": req.headers["accept-language"] || "nl,en;q=0.9",
-    "user-agent":      req.headers["user-agent"] ||
-                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
-    "host":            hostname,
+    'accept':          req.headers['accept'] || '*/*',
+    'accept-encoding': 'gzip, deflate, identity',
+    'accept-language': req.headers['accept-language'] || 'nl,en;q=0.9',
+    'user-agent':      req.headers['user-agent'] ||
+                       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0',
+    'host':            hostname,
   };
 
-  if (needsParool) {
-    reqHeaders["referer"] = SPOOF_REFERER;
-    reqHeaders["origin"]  = "https://www.parool.nl";
-    console.log(`  [parool referer] ${hostname}${upstreamPath}`);
+  if (rule) {
+    reqHeaders['referer'] = rule.referer;
+    reqHeaders['origin']  = rule.origin;
+    console.log(`  [rule: ${rule.origin}] ${hostname}${upstreamPath}`);
   } else {
-    console.log(`  [no referer]     ${hostname}${upstreamPath}`);
+    console.log(`  [no referer]          ${hostname}${upstreamPath}`);
   }
 
   const options = {
