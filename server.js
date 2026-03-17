@@ -1,7 +1,14 @@
 /**
  * Stemwijzer local proxy
- * Serves the wrapper page and proxies the embed script + iframe
- * with Referer: https://www.parool.nl/ so the app accepts the embed.
+ * Serves the wrapper page and proxies all assets/data for the embed.
+ *
+ * Referer strategy:
+ *   - embed.js and the iframe entry point  → Referer: https://www.parool.nl/
+ *   - everything else (assets, API calls)  → no Referer header at all
+ *     (mimics what a browser does when you paste a URL directly into the bar)
+ *
+ * Also rewrites absolute URLs inside proxied HTML/JS/CSS responses so that
+ * secondary fetches also go through this proxy.
  *
  * Usage:
  *   node server.js
@@ -11,12 +18,19 @@
 const http = require("http");
 const https = require("https");
 const url = require("url");
-const path = require("path");
-const fs = require("fs");
+const zlib = require("zlib");
 
 const PORT = 3000;
 const SPOOF_REFERER = "https://www.parool.nl/";
 const UPSTREAM_HOST = "gr2026.stemwijzer.nl";
+const UPSTREAM_ORIGIN = "https://" + UPSTREAM_HOST;
+const LOCAL_ORIGIN   = "http://localhost:" + PORT;
+
+// Paths that need the parool.nl referer to pass the embed check
+const NEEDS_PAROOL_REFERER = [
+  /^\/embed\/embed\.js/,
+  /^\/app\/index\.html/,
+];
 
 // ── Wrapper HTML served at / ──────────────────────────────────────────────────
 const WRAPPER_HTML = `<!DOCTYPE html>
@@ -131,36 +145,92 @@ const WRAPPER_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// ── Rewrite URLs in text responses so secondary fetches go through the proxy ──
+function rewriteBody(body, contentType) {
+  if (!/text|javascript|json/.test(contentType || "")) return body;
+  // Replace https://gr2026.stemwijzer.nl  →  http://localhost:PORT/proxy
+  return body.split(UPSTREAM_ORIGIN).join(LOCAL_ORIGIN + "/proxy");
+}
+
+// ── Decompress a buffer based on content-encoding ────────────────────────────
+function decompress(buffer, encoding) {
+  return new Promise((resolve, reject) => {
+    if (encoding === "gzip")   return zlib.gunzip(buffer, (e, b) => e ? reject(e) : resolve(b));
+    if (encoding === "deflate") return zlib.inflate(buffer, (e, b) => e ? reject(e) : resolve(b));
+    if (encoding === "br")     return zlib.brotliDecompress(buffer, (e, b) => e ? reject(e) : resolve(b));
+    resolve(buffer); // identity / no encoding
+  });
+}
+
 // ── Proxy helper ──────────────────────────────────────────────────────────────
 function proxyRequest(req, res, upstreamPath) {
+  const needsParoolReferer = NEEDS_PAROOL_REFERER.some(re => re.test(upstreamPath));
+
+  const reqHeaders = {
+    "accept":          req.headers["accept"]          || "*/*",
+    // Ask for uncompressed OR gzip — we handle both; avoids brotli issues
+    "accept-encoding": "gzip, deflate, identity",
+    "accept-language": req.headers["accept-language"] || "nl,en;q=0.9",
+    "user-agent":      req.headers["user-agent"]      || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0",
+    "host":            UPSTREAM_HOST,
+  };
+
+  if (needsParoolReferer) {
+    // Embed entry points: pretend we're parool.nl
+    reqHeaders["referer"] = SPOOF_REFERER;
+    reqHeaders["origin"]  = "https://www.parool.nl";
+    console.log(`  → sending parool referer for ${upstreamPath}`);
+  } else {
+    // Assets/API: no referer (mimics direct browser navigation — always works)
+    console.log(`  → no referer for ${upstreamPath}`);
+  }
+
   const options = {
     hostname: UPSTREAM_HOST,
     port: 443,
     path: upstreamPath,
     method: req.method,
-    headers: {
-      // Forward useful headers but override the ones that matter
-      "accept":          req.headers["accept"]          || "*/*",
-      "accept-encoding": req.headers["accept-encoding"] || "identity",
-      "accept-language": req.headers["accept-language"] || "nl,en;q=0.9",
-      "user-agent":      req.headers["user-agent"]      || "Mozilla/5.0",
-      // ← The magic: lie about where we're coming from
-      "referer":         SPOOF_REFERER,
-      "origin":          "https://www.parool.nl",
-      "host":            UPSTREAM_HOST,
-    },
+    headers: reqHeaders,
   };
 
   const upstreamReq = https.request(options, (upstreamRes) => {
-    // Strip headers that would break things in a proxied context
-    const headers = { ...upstreamRes.headers };
-    delete headers["content-security-policy"];
-    delete headers["x-frame-options"];
-    // Allow our local page to load the response
-    headers["access-control-allow-origin"] = "*";
+    const status      = upstreamRes.statusCode;
+    const contentType = upstreamRes.headers["content-type"] || "";
+    const encoding    = upstreamRes.headers["content-encoding"] || "";
 
-    res.writeHead(upstreamRes.statusCode, headers);
-    upstreamRes.pipe(res);
+    // Strip problematic response headers
+    const outHeaders = { ...upstreamRes.headers };
+    delete outHeaders["content-security-policy"];
+    delete outHeaders["x-frame-options"];
+    delete outHeaders["content-encoding"]; // we'll re-encode ourselves if needed
+    outHeaders["access-control-allow-origin"] = "*";
+
+    console.log(`  ← ${status} ${contentType.split(";")[0]} [${upstreamPath.split("?")[0]}]`);
+
+    // For text/JS/JSON: buffer, decompress, rewrite URLs, re-send
+    if (/text|javascript|json/.test(contentType)) {
+      const chunks = [];
+      upstreamRes.on("data", c => chunks.push(c));
+      upstreamRes.on("end", async () => {
+        try {
+          const raw       = Buffer.concat(chunks);
+          const decompressed = await decompress(raw, encoding);
+          const rewritten = rewriteBody(decompressed.toString("utf8"), contentType);
+          const outBuf    = Buffer.from(rewritten, "utf8");
+          outHeaders["content-length"] = String(outBuf.length);
+          res.writeHead(status, outHeaders);
+          res.end(outBuf);
+        } catch (e) {
+          console.error("Decompress/rewrite error:", e.message);
+          res.writeHead(502);
+          res.end("Proxy rewrite error: " + e.message);
+        }
+      });
+    } else {
+      // Binary assets (images, fonts, wasm…): stream straight through
+      res.writeHead(status, outHeaders);
+      upstreamRes.pipe(res);
+    }
   });
 
   upstreamReq.on("error", (err) => {
@@ -174,32 +244,35 @@ function proxyRequest(req, res, upstreamPath) {
 
 // ── Main server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  const parsed = url.parse(req.url);
+  const parsed   = url.parse(req.url);
   const pathname = parsed.pathname;
-
-  console.log(`${req.method} ${req.url}`);
 
   // Serve wrapper page
   if (pathname === "/" || pathname === "/index.html") {
+    console.log("GET / → wrapper page");
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(WRAPPER_HTML);
     return;
   }
 
-  // Proxy everything under /proxy/* to the upstream host
+  // Everything else is a proxied upstream request
+  // Support two URL shapes:
+  //   /proxy/some/path   (explicit prefix from our HTML)
+  //   /some/path         (absolute URLs rewritten inside JS/HTML by rewriteBody)
+  let upstreamPath;
   if (pathname.startsWith("/proxy/")) {
-    // Strip the /proxy prefix to get the real upstream path
-    const upstreamPath = pathname.slice("/proxy".length) +
-                         (parsed.search || "");
-    proxyRequest(req, res, upstreamPath);
-    return;
+    upstreamPath = pathname.slice("/proxy".length) + (parsed.search || "");
+  } else {
+    // Treat as a direct upstream path (rewritten URLs inside JS won't have /proxy prefix)
+    upstreamPath = pathname + (parsed.search || "");
   }
 
-  res.writeHead(404);
-  res.end("Not found");
+  console.log(`${req.method} ${upstreamPath}`);
+  proxyRequest(req, res, upstreamPath);
 });
 
 server.listen(PORT, () => {
   console.log(`\n✅  Stemwijzer proxy running at http://localhost:${PORT}`);
-  console.log(`   Open that URL in Chrome and use Translate Page as normal.\n`);
+  console.log(`   Open that URL in Chrome and use Translate Page as normal.`);
+  console.log(`   Watch this console to see which requests succeed/fail.\n`);
 });
