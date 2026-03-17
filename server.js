@@ -128,37 +128,9 @@ const WRAPPER_HTML = `<!DOCTYPE html>
     Chrome will translate the entire questionnaire automatically.
   </div>
 
-  <div id="votematch-container">
-    <div id="votematch-controls">
-      <div class="votematch-controls-left">
-        <button>ℹ️ Vote Compass &amp; media partners</button>
-        <a class="btn" href="https://stemwijzer.nl/privacy/" target="_blank" rel="noopener">
-          🔒 Privacy ↗
-        </a>
-      </div>
-      <div class="votematch-controls-right">
-        <button onclick="toggleFS()">⛶ Enlarge</button>
-      </div>
-    </div>
-
-    <iframe
-      src="/proxy/gr2026/app/index.html#/GM0363-nl/start"
-      loading="lazy"
-      scrolling="no"
-      allowfullscreen=""
-      id="votematch-embed">
-    </iframe>
-  </div>
+  <div id="votematch-container"></div>
 
   <script src="/proxy/gr2026/embed/embed.js?v=1.0.0&select=gm0363-nl&canselect=true" defer async></script>
-
-  <script>
-    function toggleFS() {
-      var el = document.getElementById("votematch-container");
-      if (!document.fullscreenElement) el.requestFullscreen();
-      else document.exitFullscreen();
-    }
-  </script>
 </body>
 </html>`;
 
