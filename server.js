@@ -23,7 +23,7 @@ const https = require("https");
 const url   = require("url");
 const zlib  = require("zlib");
 
-const PORT          = 3000;
+const PORT = process.env.PORT || 3000;
 const SPOOF_REFERER = "https://www.parool.nl/";
 const LOCAL_ORIGIN  = "http://localhost:" + PORT;
 const STEMWIJZER_RE = /https:\/\/([\w-]+\.stemwijzer\.nl)/g;
